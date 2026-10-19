@@ -82,7 +82,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 解决黑屏关键：移到后台 IO 线程秒级扫描
     private val pickFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         uri?.let {
             isScanning = true
@@ -91,7 +90,7 @@ class MainActivity : ComponentActivity() {
                 withContext(Dispatchers.Main) {
                     selectedItems.addAll(list)
                     isScanning = false
-                    Toast.makeText(this@MainActivity, "扫描完成：共加入 ${list.size} 个散落文件", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "扫描完成：共发现 ${list.size} 个文件", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -248,6 +247,7 @@ fun TransferAppScreen(
     var singleProgress by remember { mutableStateOf(0f) }
     var currentIndex by remember { mutableStateOf(0) }
     var totalCount by remember { mutableStateOf(0) }
+    var isTransferring by remember { mutableStateOf(false) }
 
     var showAppConfirmDialog by remember { mutableStateOf(false) }
     var targetIp by remember { mutableStateOf("192.168.43.1") }
@@ -279,7 +279,7 @@ fun TransferAppScreen(
         ) {
             Column {
                 Text("P2P 热点快传", style = MaterialTheme.typography.headlineMedium)
-                Text("大文件毫秒直扫 · 防闪退优化", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("断点续传 · 智能秒传跳过 · 满速直连", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             }
             IconButton(onClick = onToggleDarkMode) {
                 Icon(
@@ -315,8 +315,8 @@ fun TransferAppScreen(
                                         onInstallApk(file)
                                     }
                                 },
-                                onAllFinished = {
-                                    logs += "\n[状态] 所有项目接收完毕！"
+                                onAllFinished = { success ->
+                                    logs += if (success) "\n[状态] 所有项目接收完毕！" else "\n[状态] 接收异常中断，请重新启动接收端！"
                                 }
                             )
                         },
@@ -391,13 +391,13 @@ fun TransferAppScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Button(onClick = onPickSingleFiles, modifier = Modifier.weight(1f)) {
+                Button(onClick = onPickSingleFiles, modifier = Modifier.weight(1f), enabled = !isTransferring) {
                     Text("选文件", style = MaterialTheme.typography.labelMedium)
                 }
                 Button(
                     onClick = onOpenFolderPicker,
                     modifier = Modifier.weight(1f),
-                    enabled = !isScanning
+                    enabled = !isScanning && !isTransferring
                 ) {
                     if (isScanning) {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -405,7 +405,7 @@ fun TransferAppScreen(
                         Text("选文件夹", style = MaterialTheme.typography.labelMedium)
                     }
                 }
-                Button(onClick = { showAppConfirmDialog = true }, modifier = Modifier.weight(1f)) {
+                Button(onClick = { showAppConfirmDialog = true }, modifier = Modifier.weight(1f), enabled = !isTransferring) {
                     Text("扫应用", style = MaterialTheme.typography.labelMedium)
                 }
             }
@@ -415,6 +415,7 @@ fun TransferAppScreen(
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = {
+                        isTransferring = true
                         val service = transferServiceGetter()
                         service?.runSenderTask(
                             targetIp = targetIp,
@@ -426,22 +427,31 @@ fun TransferAppScreen(
                                 currentIndex = curr
                                 totalCount = total
                             },
-                            onAllFinished = {
-                                selectedItems.clear()
-                                logs += "\n[状态] 所有项目已满速推送完毕！"
+                            onAllFinished = { success ->
+                                isTransferring = false
+                                if (success) {
+                                    selectedItems.clear()
+                                    logs += "\n[状态] 所有项目已完成同步传输！"
+                                } else {
+                                    logs += "\n[提示] 传输中断。无需清空，重新点击「继续发送」即可断点续传！"
+                                }
                             }
                         )
                     },
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                    enabled = selectedItems.isNotEmpty() && !isScanning
+                    enabled = selectedItems.isNotEmpty() && !isScanning && !isTransferring
                 ) {
                     val totalMB = selectedItems.sumOf { it.size } / 1024 / 1024
-                    Text("开始传输 (${selectedItems.size}项 / 约${totalMB}MB)")
+                    Text(if (currentIndex > 0) "继续发送 (${selectedItems.size}项)" else "开始传输 (${selectedItems.size}项 / 约${totalMB}MB)")
                 }
 
-                if (selectedItems.isNotEmpty()) {
-                    OutlinedButton(onClick = { selectedItems.clear() }) {
+                if (selectedItems.isNotEmpty() && !isTransferring) {
+                    OutlinedButton(onClick = {
+                        selectedItems.clear()
+                        currentIndex = 0
+                        totalCount = 0
+                    }) {
                         Text("清空")
                     }
                 }
