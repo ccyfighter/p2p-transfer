@@ -1,38 +1,76 @@
 package com.transfer.p2p
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
+import java.io.File
 import java.io.FileInputStream
+import java.net.NetworkInterface
 
 class MainActivity : ComponentActivity() {
 
     private val engine = TransferEngine()
     private val selectedItems = mutableStateListOf<TransferItem>()
+    private var scannedIpCallback: ((String) -> Unit)? = null
 
+    // 单个/多个独立文件选择器
+    private val pickFilesLauncher = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        uris?.forEach { uri ->
+            val nameAndSize = getFileNameAndSize(this, uri)
+            selectedItems.add(
+                TransferItem(
+                    name = nameAndSize.first,
+                    size = nameAndSize.second,
+                    openStream = { ctx -> ctx.contentResolver.openInputStream(uri) }
+                )
+            )
+        }
+        Toast.makeText(this, "已追加 ${uris.size} 个文件", Toast.LENGTH_SHORT).show()
+    }
+
+    // 文件夹树选择器
     private val pickFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         uri?.let {
             val list = FileHelper.collectTreeFiles(this, it)
             selectedItems.addAll(list)
-            Toast.makeText(this, "已收录文件夹内 ${list.size} 个散落文件", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "已展开添加文件夹内 ${list.size} 个散落文件", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // 二维码扫码器
+    private val scanQrLauncher = registerForActivityResult(ScanContract()) { result ->
+        if (result.contents != null) {
+            val raw = result.contents
+            val ip = if (raw.startsWith("p2p://")) raw.removePrefix("p2p://") else raw
+            scannedIpCallback?.invoke(ip)
+            Toast.makeText(this, "成功识别服务端 IP: $ip", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -45,7 +83,17 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     TransferAppScreen(
                         selectedItems = selectedItems,
+                        onPickSingleFiles = { pickFilesLauncher.launch(arrayOf("*/*")) },
                         onOpenFolderPicker = { pickFolderLauncher.launch(null) },
+                        onScanQr = { callback ->
+                            scannedIpCallback = callback
+                            val options = ScanOptions().apply {
+                                setPrompt("请扫描接收端屏幕上的二维码")
+                                setBeepEnabled(true)
+                                setOrientationLocked(true)
+                            }
+                            scanQrLauncher.launch(options)
+                        },
                         onInstallApk = { FileHelper.installApk(this, it) },
                         onFetchApps = { FileHelper.getInstalledApps(this) },
                         onStartSend = { ip, onLog, onProgress ->
@@ -74,13 +122,68 @@ class MainActivity : ComponentActivity() {
             )
         }
     }
+
+    private fun getFileNameAndSize(context: Context, uri: Uri): Pair<String, Long> {
+        var name = "unknown_file"
+        var size = 0L
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (cursor.moveToFirst()) {
+                if (nameIndex != -1) name = cursor.getString(nameIndex)
+                if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+            }
+        }
+        return Pair(name, size)
+    }
+}
+
+// 动态提取本机热点局域网 IP
+fun getLocalHotspotIp(): String {
+    try {
+        val interfaces = NetworkInterface.getNetworkInterfaces()
+        while (interfaces.hasMoreElements()) {
+            val intf = interfaces.nextElement()
+            // Android 热点虚拟网卡通常叫 wlan1, ap0, rndis0 等
+            val enumIpAddr = intf.inetAddresses
+            while (enumIpAddr.hasMoreElements()) {
+                val inetAddress = enumIpAddr.nextElement()
+                if (!inetAddress.isLoopbackAddress && inetAddress.hostAddress?.contains(":") == false) {
+                    val ip = inetAddress.hostAddress ?: ""
+                    if (ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
+                        return ip
+                    }
+                }
+            }
+        }
+    } catch (_: Exception) {}
+    return "192.168.43.1" // 兜底
+}
+
+// 本地离线生成二维码图片
+fun generateQrBitmap(content: String): Bitmap? {
+    return try {
+        val size = 512
+        val bitMatrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, size, size)
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
+        for (x in 0 until size) {
+            for (y in 0 until size) {
+                bitmap.setPixel(x, y, if (bitMatrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+            }
+        }
+        bitmap
+    } catch (e: Exception) {
+        null
+    }
 }
 
 @Composable
 fun TransferAppScreen(
     selectedItems: MutableList<TransferItem>,
+    onPickSingleFiles: () -> Unit,
     onOpenFolderPicker: () -> Unit,
-    onInstallApk: (java.io.File) -> Unit,
+    onScanQr: ((String) -> Unit) -> Unit,
+    onInstallApk: (File) -> Unit,
     onFetchApps: () -> List<AppItem>,
     onStartSend: suspend (ip: String, onLog: (String) -> Unit, onProgress: (String, Float) -> Unit) -> Unit,
     engine: TransferEngine
@@ -93,34 +196,30 @@ fun TransferAppScreen(
 
     var showAppConfirmDialog by remember { mutableStateOf(false) }
     var targetIp by remember { mutableStateOf("192.168.43.1") }
+    var serverLocalIp by remember { mutableStateOf("") }
     var appList by remember { mutableStateOf<List<AppItem>>(emptyList()) }
 
     if (showAppConfirmDialog) {
         AlertDialog(
             onDismissRequest = { showAppConfirmDialog = false },
-            title = { Text("读取应用列表授权确认") },
-            text = { Text("传输应用需要扫描本机已安装的所有非系统应用，并读取安装包进行传输。是否同意授权读取？") },
+            title = { Text("授权确认") },
+            text = { Text("读取应用列表需要扫描本机已安装非系统应用并提取 base.apk，是否允许？") },
             confirmButton = {
                 TextButton(onClick = {
                     showAppConfirmDialog = false
                     appList = onFetchApps()
-                }) {
-                    Text("同意授权")
-                }
+                }) { Text("同意") }
             },
             dismissButton = {
-                TextButton(onClick = { showAppConfirmDialog = false }) {
-                    Text("取消")
-                }
+                TextButton(onClick = { showAppConfirmDialog = false }) { Text("取消") }
             }
         )
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("P2P 热点极速快传", style = MaterialTheme.typography.headlineMedium)
-        Text("两台手机纯热点直连 · 不走公网 · 零流量消耗", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
         if (mode == "HOME") {
             Card(modifier = Modifier.fillMaxWidth()) {
@@ -130,6 +229,7 @@ fun TransferAppScreen(
                     Button(
                         onClick = {
                             mode = "RECEIVER"
+                            serverLocalIp = getLocalHotspotIp()
                             scope.launch {
                                 engine.startServer(
                                     onLog = { logs += "\n$it" },
@@ -147,48 +247,72 @@ fun TransferAppScreen(
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("设为【接收端】(K100 开热点)")
+                        Text("【接收端】(开热点机)")
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))
 
                     Button(
-                        onClick = {
-                            mode = "SENDER"
-                        },
+                        onClick = { mode = "SENDER" },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("设为【发送端】(K80 连热点)")
+                        Text("【发送端】(连热点机)")
                     }
                 }
             }
         }
 
         if (mode == "RECEIVER") {
-            Text("接收端运行中...", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            Text("请确保本机热点已开，文件将保存至 Downloads/P2PTransfer")
-            if (progressText.isNotEmpty()) {
-                LinearProgressIndicator(progress = currentProgress, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
-                Text(progressText)
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("本机热点真实 IP: $serverLocalIp", style = MaterialTheme.typography.titleMedium)
+                    Text("请用发送端连接本热点后【扫码连接】", style = MaterialTheme.typography.bodySmall)
+
+                    val qr = remember(serverLocalIp) { generateQrBitmap("p2p://$serverLocalIp") }
+                    qr?.let {
+                        Image(
+                            bitmap = it.asImageBitmap(),
+                            contentDescription = "QR Code",
+                            modifier = Modifier.size(200.dp).padding(vertical = 12.dp)
+                        )
+                    }
+
+                    if (progressText.isNotEmpty()) {
+                        LinearProgressIndicator(progress = currentProgress, modifier = Modifier.fillMaxWidth())
+                        Text(progressText, modifier = Modifier.padding(top = 4.dp))
+                    }
+                }
             }
         }
 
         if (mode == "SENDER") {
-            OutlinedTextField(
-                value = targetIp,
-                onValueChange = { targetIp = it },
-                label = { Text("热点主机 IP (默认 192.168.43.1)") },
-                modifier = Modifier.fillMaxWidth()
-            )
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = targetIp,
+                    onValueChange = { targetIp = it },
+                    label = { Text("目标 IP") },
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Button(onClick = {
+                    onScanQr { scanned -> targetIp = scanned }
+                }) {
+                    Text("扫码配对")
+                }
+            }
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { showAppConfirmDialog = true }, modifier = Modifier.weight(1f)) {
-                    Text("扫描应用")
+            // 三项选择入口：单文件/多选、文件夹树、应用列表
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Button(onClick = onPickSingleFiles, modifier = Modifier.weight(1f)) {
+                    Text("选文件", style = MaterialTheme.typography.labelMedium)
                 }
                 Button(onClick = onOpenFolderPicker, modifier = Modifier.weight(1f)) {
-                    Text("添加文件夹")
+                    Text("选文件夹", style = MaterialTheme.typography.labelMedium)
+                }
+                Button(onClick = { showAppConfirmDialog = true }, modifier = Modifier.weight(1f)) {
+                    Text("扫应用", style = MaterialTheme.typography.labelMedium)
                 }
             }
 
@@ -206,16 +330,16 @@ fun TransferAppScreen(
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
             ) {
-                Text("开始发送已选内容 (共 ${selectedItems.size} 个项目)")
+                Text("开始传输 (已选 ${selectedItems.size} 项)")
             }
 
             if (appList.isNotEmpty()) {
-                Text("点击应用加入发送队列:", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 8.dp))
+                Text("已安装应用 (点击加入待传列表):", style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 6.dp))
                 LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
                     items(appList) { app ->
                         val isAdded = selectedItems.any { it.name == "${app.name}.apk" }
                         Card(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
                             colors = CardDefaults.cardColors(
                                 containerColor = if (isAdded) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
                             ),
@@ -244,9 +368,9 @@ fun TransferAppScreen(
         }
 
         Spacer(modifier = Modifier.height(8.dp))
-        Text("传输日志：", style = MaterialTheme.typography.labelSmall)
-        Card(modifier = Modifier.fillMaxWidth().height(120.dp)) {
-            LazyColumn(modifier = Modifier.padding(8.dp)) {
+        Text("传输状态日志：", style = MaterialTheme.typography.labelSmall)
+        Card(modifier = Modifier.fillMaxWidth().height(110.dp)) {
+            LazyColumn(modifier = Modifier.padding(6.dp)) {
                 item {
                     Text(logs, style = MaterialTheme.typography.bodySmall)
                 }
