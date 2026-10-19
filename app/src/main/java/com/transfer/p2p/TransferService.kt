@@ -24,6 +24,8 @@ class TransferService : Service() {
     private val NOTIFICATION_ID = 1001
     private val CHANNEL_ID = "p2p_transfer_channel"
 
+    private var lastNotifyTime = 0L
+
     inner class LocalBinder : Binder() {
         fun getService(): TransferService = this@TransferService
     }
@@ -39,7 +41,7 @@ class TransferService : Service() {
     private fun acquireLocks() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "P2PTransfer::ServiceWakeLock").apply {
-            acquire(2 * 60 * 60 * 1000L) // 最长保活2小时
+            acquire(4 * 60 * 60 * 1000L) // 延长至 4 小时
         }
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "P2PTransfer::ServiceWifiLock").apply {
@@ -63,7 +65,11 @@ class TransferService : Service() {
         }
     }
 
-    private fun updateNotification(title: String, content: String, progress: Int, max: Int) {
+    private fun updateNotification(title: String, content: String, progress: Int, max: Int, force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastNotifyTime < 300) return // 300ms 节流，避免高频 I/O 拖垮系统通知管理器
+        lastNotifyTime = now
+
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
@@ -88,15 +94,15 @@ class TransferService : Service() {
         }
     }
 
-    // 接收端任务
     fun runReceiverTask(
         onLog: (String) -> Unit,
         onProgress: (fileName: String, progress: Float, current: Int, total: Int) -> Unit,
         onCompleted: (File) -> Unit,
-        onAllFinished: () -> Unit
+        onAllFinished: (Boolean) -> Unit
     ) {
-        updateNotification("接收端运行中", "等待连接并接收文件...", 0, 0)
+        updateNotification("接收端运行中", "等待连接并接收文件...", 0, 0, force = true)
         serviceScope.launch {
+            var success = false
             try {
                 engine.startServer(
                     onLog = onLog,
@@ -111,25 +117,28 @@ class TransferService : Service() {
                     },
                     onCompleted = onCompleted
                 )
+                success = true
+            } catch (e: Exception) {
+                onLog("接收任务异常: ${e.message}")
             } finally {
                 withContext(Dispatchers.Main) {
-                    onAllFinished()
-                    stopSelfGracefully() // 任务一完自动结束并干掉通知栏
+                    onAllFinished(success)
+                    stopSelfGracefully()
                 }
             }
         }
     }
 
-    // 发送端任务
     fun runSenderTask(
         targetIp: String,
         items: List<TransferItem>,
         onLog: (String) -> Unit,
         onProgress: (fileName: String, progress: Float, current: Int, total: Int) -> Unit,
-        onAllFinished: () -> Unit
+        onAllFinished: (Boolean) -> Unit
     ) {
-        updateNotification("发送端已启动", "正在发送数据...", 0, 0)
+        updateNotification("发送端已启动", "正在发送数据...", 0, 0, force = true)
         serviceScope.launch {
+            var success = false
             try {
                 engine.sendItems(
                     context = applicationContext,
@@ -146,12 +155,13 @@ class TransferService : Service() {
                         onProgress(name, p, curr, total)
                     }
                 )
+                success = true
             } catch (e: Exception) {
-                // 忽略或打印异常
+                onLog("发送任务中断: ${e.message}")
             } finally {
                 withContext(Dispatchers.Main) {
-                    onAllFinished()
-                    stopSelfGracefully() // 发送完毕立即销毁通知栏
+                    onAllFinished(success)
+                    stopSelfGracefully()
                 }
             }
         }
