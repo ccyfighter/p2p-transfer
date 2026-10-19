@@ -1,14 +1,13 @@
 package com.transfer.p2p
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.provider.OpenableColumns
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -22,6 +21,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
@@ -37,40 +37,40 @@ import java.net.NetworkInterface
 class MainActivity : ComponentActivity() {
 
     private val engine = TransferEngine()
-    private val selectedItems = mutableStateListOf<TransferItem>()
+    val selectedItems = mutableStateListOf<TransferItem>()
     private var scannedIpCallback: ((String) -> Unit)? = null
 
-    // 单个/多个独立文件选择器
+    // 单个/多选文件选择器（使用严谨的大小解析逻辑）
     private val pickFilesLauncher = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         uris?.forEach { uri ->
-            val nameAndSize = getFileNameAndSize(this, uri)
+            val details = FileHelper.getUriDetails(this, uri)
             selectedItems.add(
                 TransferItem(
-                    name = nameAndSize.first,
-                    size = nameAndSize.second,
+                    name = details.first,
+                    size = details.second,
                     openStream = { ctx -> ctx.contentResolver.openInputStream(uri) }
                 )
             )
         }
-        Toast.makeText(this, "已追加 ${uris.size} 个文件", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "已添加 ${uris.size} 个文件", Toast.LENGTH_SHORT).show()
     }
 
-    // 文件夹树选择器
+    // 文件夹选择器
     private val pickFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         uri?.let {
             val list = FileHelper.collectTreeFiles(this, it)
             selectedItems.addAll(list)
-            Toast.makeText(this, "已展开添加文件夹内 ${list.size} 个散落文件", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "已展开添加 ${list.size} 个散落文件", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // 二维码扫码器
+    // 二维码扫码
     private val scanQrLauncher = registerForActivityResult(ScanContract()) { result ->
         if (result.contents != null) {
             val raw = result.contents
             val ip = if (raw.startsWith("p2p://")) raw.removePrefix("p2p://") else raw
             scannedIpCallback?.invoke(ip)
-            Toast.makeText(this, "成功识别服务端 IP: $ip", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "成功配对 IP: $ip", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -95,14 +95,32 @@ class MainActivity : ComponentActivity() {
                             scanQrLauncher.launch(options)
                         },
                         onInstallApk = { FileHelper.installApk(this, it) },
+                        onNotifyFileSaved = { file -> FileHelper.notifyMediaScanner(this, file) },
+                        onOpenDownloadFolder = { openDownloadFolder() },
                         onFetchApps = { FileHelper.getInstalledApps(this) },
-                        onStartSend = { ip, onLog, onProgress ->
+                        onStartSend = { ip, onLog, onProgress, onFinish ->
                             engine.sendItems(this, ip, selectedItems.toList(), onLog, onProgress)
+                            onFinish()
                         },
                         engine = engine
                     )
                 }
             }
+        }
+    }
+
+    // 调起系统文件管理器直达保存目录
+    private fun openDownloadFolder() {
+        val folder = FileHelper.getDownloadDir()
+        val uri = Uri.parse("content://com.android.externalstorage.documents/document/primary:Download%2FP2PTransfer")
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            Toast.makeText(this, "文件保存在: ${folder.absolutePath}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -122,29 +140,13 @@ class MainActivity : ComponentActivity() {
             )
         }
     }
-
-    private fun getFileNameAndSize(context: Context, uri: Uri): Pair<String, Long> {
-        var name = "unknown_file"
-        var size = 0L
-        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-            if (cursor.moveToFirst()) {
-                if (nameIndex != -1) name = cursor.getString(nameIndex)
-                if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
-            }
-        }
-        return Pair(name, size)
-    }
 }
 
-// 动态提取本机热点局域网 IP
 fun getLocalHotspotIp(): String {
     try {
         val interfaces = NetworkInterface.getNetworkInterfaces()
         while (interfaces.hasMoreElements()) {
             val intf = interfaces.nextElement()
-            // Android 热点虚拟网卡通常叫 wlan1, ap0, rndis0 等
             val enumIpAddr = intf.inetAddresses
             while (enumIpAddr.hasMoreElements()) {
                 val inetAddress = enumIpAddr.nextElement()
@@ -157,10 +159,9 @@ fun getLocalHotspotIp(): String {
             }
         }
     } catch (_: Exception) {}
-    return "192.168.43.1" // 兜底
+    return "192.168.43.1"
 }
 
-// 本地离线生成二维码图片
 fun generateQrBitmap(content: String): Bitmap? {
     return try {
         val size = 512
@@ -184,8 +185,10 @@ fun TransferAppScreen(
     onOpenFolderPicker: () -> Unit,
     onScanQr: ((String) -> Unit) -> Unit,
     onInstallApk: (File) -> Unit,
+    onNotifyFileSaved: (File) -> Unit,
+    onOpenDownloadFolder: () -> Unit,
     onFetchApps: () -> List<AppItem>,
-    onStartSend: suspend (ip: String, onLog: (String) -> Unit, onProgress: (String, Float) -> Unit) -> Unit,
+    onStartSend: suspend (ip: String, onLog: (String) -> Unit, onProgress: (String, Float) -> Unit, onFinish: () -> Unit) -> Unit,
     engine: TransferEngine
 ) {
     var mode by remember { mutableStateOf("HOME") }
@@ -238,6 +241,8 @@ fun TransferAppScreen(
                                         currentProgress = p
                                     },
                                     onCompleted = { file ->
+                                        // 关键：广播通知系统媒体库刷新相册
+                                        onNotifyFileSaved(file)
                                         if (file.name.endsWith(".apk")) {
                                             onInstallApk(file)
                                         }
@@ -266,19 +271,26 @@ fun TransferAppScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("本机热点真实 IP: $serverLocalIp", style = MaterialTheme.typography.titleMedium)
-                    Text("请用发送端连接本热点后【扫码连接】", style = MaterialTheme.typography.bodySmall)
+                    Text("保存位置: 内部存储/Download/P2PTransfer", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
 
                     val qr = remember(serverLocalIp) { generateQrBitmap("p2p://$serverLocalIp") }
                     qr?.let {
                         Image(
                             bitmap = it.asImageBitmap(),
                             contentDescription = "QR Code",
-                            modifier = Modifier.size(200.dp).padding(vertical = 12.dp)
+                            modifier = Modifier.size(180.dp).padding(vertical = 8.dp)
                         )
                     }
 
+                    Button(
+                        onClick = onOpenDownloadFolder,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                    ) {
+                        Text("打开接收文件夹")
+                    }
+
                     if (progressText.isNotEmpty()) {
-                        LinearProgressIndicator(progress = currentProgress, modifier = Modifier.fillMaxWidth())
+                        LinearProgressIndicator(progress = currentProgress, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
                         Text(progressText, modifier = Modifier.padding(top = 4.dp))
                     }
                 }
@@ -303,7 +315,6 @@ fun TransferAppScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // 三项选择入口：单文件/多选、文件夹树、应用列表
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Button(onClick = onPickSingleFiles, modifier = Modifier.weight(1f)) {
                     Text("选文件", style = MaterialTheme.typography.labelMedium)
@@ -318,19 +329,30 @@ fun TransferAppScreen(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            Button(
-                onClick = {
-                    scope.launch {
-                        onStartSend(targetIp, { logs += "\n$it" }, { name, p ->
-                            progressText = "$name : ${(p * 100).toInt()}%"
-                            currentProgress = p
-                        })
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        scope.launch {
+                            onStartSend(targetIp, { logs += "\n$it" }, { name, p ->
+                                progressText = "$name : ${(p * 100).toInt()}%"
+                                currentProgress = p
+                            }, {
+                                // 关键：传输完成后清空选中列表
+                                selectedItems.clear()
+                            })
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("开始传输 (${selectedItems.size}项)")
+                }
+
+                if (selectedItems.isNotEmpty()) {
+                    OutlinedButton(onClick = { selectedItems.clear() }) {
+                        Text("清空")
                     }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-            ) {
-                Text("开始传输 (已选 ${selectedItems.size} 项)")
+                }
             }
 
             if (appList.isNotEmpty()) {
