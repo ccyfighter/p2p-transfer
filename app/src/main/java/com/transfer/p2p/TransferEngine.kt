@@ -12,7 +12,7 @@ class TransferEngine {
 
     companion object {
         const val PORT = 9099
-        private const val BUFFER_SIZE = 128 * 1024 // 128KB 缓冲区
+        private const val BUFFER_SIZE = 256 * 1024 // 扩大缓冲区到 256KB 提升 UFS 闪存爆发读写吞吐
     }
 
     // 接收服务端
@@ -24,19 +24,19 @@ class TransferEngine {
         var serverSocket: ServerSocket? = null
         try {
             serverSocket = ServerSocket(PORT)
-            onLog("接收端服务就绪，端口: $PORT")
+            onLog("接收服务就绪，端口: $PORT")
 
             while (!serverSocket.isClosed) {
                 val client = serverSocket.accept()
-                onLog("已建立连接: ${client.inetAddress.hostAddress}")
+                client.tcpNoDelay = true // 关闭 Nagle 算法，消除微小网络包延迟
+                onLog("已建立传输通道: ${client.inetAddress.hostAddress}")
 
-                val dis = DataInputStream(BufferedInputStream(client.getInputStream()))
+                val dis = DataInputStream(BufferedInputStream(client.getInputStream(), BUFFER_SIZE))
                 val baseDir = FileHelper.getDownloadDir()
 
-                // 先读取本批次总任务数
                 val totalCount = dis.readInt()
                 var currentIndex = 0
-                onLog("本批次待接收任务总数: $totalCount 个")
+                onLog("待接收总数: $totalCount 个项目")
 
                 while (true) {
                     val hasNext = try { dis.readBoolean() } catch (e: EOFException) { false }
@@ -45,14 +45,11 @@ class TransferEngine {
                     currentIndex++
                     val relPath = dis.readUTF()
                     val fileSize = dis.readLong()
-                    val expectedCrc = dis.readLong() // 接收端预期的 CRC32
-
-                    onLog("正在接收 [$currentIndex/$totalCount]: $relPath (${fileSize / 1024 / 1024} MB)")
 
                     val targetFile = File(baseDir, relPath)
                     targetFile.parentFile?.mkdirs()
 
-                    val crc = CRC32()
+                    val localCrc = CRC32()
                     FileOutputStream(targetFile).use { fos ->
                         val buffer = ByteArray(BUFFER_SIZE)
                         var bytesRemaining = fileSize
@@ -61,9 +58,9 @@ class TransferEngine {
                         while (bytesRemaining > 0) {
                             val toRead = Math.min(buffer.size.toLong(), bytesRemaining).toInt()
                             val read = dis.read(buffer, 0, toRead)
-                            if (read == -1) throw IOException("传输中断")
+                            if (read == -1) throw IOException("传输中途对端断开")
                             fos.write(buffer, 0, read)
-                            crc.update(buffer, 0, read)
+                            localCrc.update(buffer, 0, read)
                             bytesRemaining -= read
                             totalRead += read
 
@@ -73,19 +70,22 @@ class TransferEngine {
                         fos.flush()
                     }
 
-                    // CRC32 一致性校验
-                    if (crc.value == expectedCrc) {
-                        onLog("校验通过: $relPath")
+                    // 读入对端边传边算追加在末尾的真实 CRC32
+                    val remoteCrc = dis.readLong()
+
+                    if (localCrc.value == remoteCrc) {
+                        onLog("校验一致 [$currentIndex/$totalCount]: $relPath")
                         onCompleted(targetFile)
                     } else {
-                        onLog("⚠️ CRC 校验失败（数据损坏）: $relPath")
+                        onLog("⚠️ 校验失败（数据受损）: $relPath")
                     }
                 }
                 client.close()
-                onLog("批次任务接收完毕！")
+                onLog("本次所有任务处理完毕！")
+                break // 完成后结束此轮监听
             }
         } catch (e: Exception) {
-            onLog("通信异常: ${e.message}")
+            onLog("传输服务已关闭/中断: ${e.message}")
         } finally {
             serverSocket?.close()
         }
@@ -100,59 +100,56 @@ class TransferEngine {
         onProgress: (fileName: String, fileProgress: Float, current: Int, total: Int) -> Unit
     ) = withContext(Dispatchers.IO) {
         try {
-            onLog("正在连接热点网关: $serverIp:$PORT ...")
+            onLog("正在连接目标: $serverIp:$PORT ...")
             val socket = Socket(serverIp, PORT)
-            val dos = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+            socket.tcpNoDelay = true
+            val dos = DataOutputStream(BufferedOutputStream(socket.getOutputStream(), BUFFER_SIZE))
 
             val totalCount = items.size
-            dos.writeInt(totalCount) // 发送总文件数
+            dos.writeInt(totalCount)
             dos.flush()
 
             var currentIndex = 0
+            val buffer = ByteArray(BUFFER_SIZE)
+
             for (item in items) {
                 currentIndex++
-                onLog("准备推送 [$currentIndex/$totalCount]: ${item.name} ...")
-
-                // 计算 CRC32
-                val crc = CRC32()
-                val tempBuffer = ByteArray(BUFFER_SIZE)
-                var crcInput = item.openStream(context)
-                crcInput?.use { input ->
-                    var r: Int
-                    while (input.read(tempBuffer).also { r = it } != -1) {
-                        crc.update(tempBuffer, 0, r)
-                    }
-                }
-
                 dos.writeBoolean(true)
                 dos.writeUTF(item.name)
                 dos.writeLong(item.size)
-                dos.writeLong(crc.value) // 发送 CRC32
-                dos.flush()
 
-                val input = item.openStream(context) ?: continue
-                input.use { fis ->
-                    var bytesRead: Int
-                    var totalSent = 0L
-                    val totalSize = item.size
+                val localCrc = CRC32()
+                val input = item.openStream(context)
+                if (input != null) {
+                    input.use { fis ->
+                        var bytesRead: Int
+                        var totalSent = 0L
+                        val totalSize = item.size
 
-                    while (fis.read(tempBuffer).also { bytesRead = it } != -1) {
-                        dos.write(tempBuffer, 0, bytesRead)
-                        totalSent += bytesRead
-                        if (totalSize > 0) {
-                            onProgress(item.name, totalSent.toFloat() / totalSize, currentIndex, totalCount)
+                        // 关键：单次顺序读入，同时送入网络与 CRC32，绝不二次读盘
+                        while (fis.read(buffer).also { bytesRead = it } != -1) {
+                            dos.write(buffer, 0, bytesRead)
+                            localCrc.update(buffer, 0, bytesRead)
+                            totalSent += bytesRead
+                            if (totalSize > 0) {
+                                onProgress(item.name, totalSent.toFloat() / totalSize, currentIndex, totalCount)
+                            }
                         }
+                        dos.flush()
                     }
-                    dos.flush()
                 }
-                onLog("已推送完成: ${item.name}")
+                // 在文件尾部追加写出 CRC32
+                dos.writeLong(localCrc.value)
+                dos.flush()
+                onLog("已送达 [$currentIndex/$totalCount]: ${item.name}")
             }
-            dos.writeBoolean(false) // 结束信号
+            dos.writeBoolean(false) // 结束标识
             dos.flush()
             socket.close()
             onLog("全部 $totalCount 个项目推送完成！")
         } catch (e: Exception) {
             onLog("发送中断: ${e.message}")
+            throw e
         }
     }
 }
