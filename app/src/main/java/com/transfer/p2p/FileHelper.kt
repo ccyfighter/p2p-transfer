@@ -4,9 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.provider.OpenableColumns
 import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
@@ -26,6 +28,24 @@ data class AppItem(
 )
 
 object FileHelper {
+
+    // 获取公共存储目录：内部存储/Download/P2PTransfer
+    fun getDownloadDir(): File {
+        val target = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "P2PTransfer")
+        if (!target.exists()) target.mkdirs()
+        return target
+    }
+
+    // 关键：通知系统媒体扫描器，让相册、视频、文件管理器立即展示新接收的文件
+    fun notifyMediaScanner(context: Context, file: File) {
+        MediaScannerConnection.scanFile(
+            context,
+            arrayOf(file.absolutePath),
+            null
+        ) { path, uri ->
+            // 媒体库索引更新完成
+        }
+    }
 
     // 获取非系统应用列表
     fun getInstalledApps(context: Context): List<AppItem> {
@@ -49,6 +69,34 @@ object FileHelper {
             }
         }
         return list.sortedBy { it.name }
+    }
+
+    // 严谨获取 URI 文件大小（解决图片选择时返回 0 的问题）
+    fun getUriDetails(context: Context, uri: Uri): Pair<String, Long> {
+        var name = "unknown_${System.currentTimeMillis()}"
+        var size = 0L
+
+        // 尝试通过 ContentResolver 查询
+        try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (cursor.moveToFirst()) {
+                    if (nameIndex != -1) name = cursor.getString(nameIndex) ?: name
+                    if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 如果未取到大小，回退到 FileDescriptor 查询
+        if (size <= 0L) {
+            try {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                    size = pfd.statSize
+                }
+            } catch (_: Exception) {}
+        }
+        return Pair(name, size)
     }
 
     // 递归遍历用户选中的文件夹，并平铺所有零散子文件
@@ -94,11 +142,5 @@ object FileHelper {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
         }
         context.startActivity(intent)
-    }
-
-    fun getDownloadDir(): File {
-        val target = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "P2PTransfer")
-        if (!target.exists()) target.mkdirs()
-        return target
     }
 }
