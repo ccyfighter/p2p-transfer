@@ -1,15 +1,16 @@
 package com.transfer.p2p
 
 import android.Manifest
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.graphics.Bitmap
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.os.PowerManager
+import android.os.IBinder
 import android.provider.DocumentsContract
 import android.provider.Settings
 import android.view.WindowManager
@@ -37,20 +38,31 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
-import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
 import java.net.NetworkInterface
 
 class MainActivity : ComponentActivity() {
 
-    private val engine = TransferEngine()
     val selectedItems = mutableStateListOf<TransferItem>()
     private var scannedIpCallback: ((String) -> Unit)? = null
 
-    // 保活 Locks
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    // Service 绑定相关
+    var transferService: TransferService? = null
+    var isServiceBound = false
+
+    private val serviceConn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as TransferService.LocalBinder
+            transferService = binder.getService()
+            isServiceBound = true
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            transferService = null
+            isServiceBound = false
+        }
+    }
 
     private val pickFilesLauncher = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         uris?.forEach { uri ->
@@ -63,7 +75,7 @@ class MainActivity : ComponentActivity() {
                 )
             )
         }
-        Toast.makeText(this, "已追加 ${uris.size} 个文件", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "已添加 ${uris.size} 个文件", Toast.LENGTH_SHORT).show()
     }
 
     private val pickFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -79,13 +91,23 @@ class MainActivity : ComponentActivity() {
             val raw = result.contents
             val ip = if (raw.startsWith("p2p://")) raw.removePrefix("p2p://") else raw
             scannedIpCallback?.invoke(ip)
-            Toast.makeText(this, "已配对 IP: $ip", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "已识别 IP: $ip", Toast.LENGTH_SHORT).show()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         checkAllFilesAccessPermission()
+
+        // 启动并绑定前台服务
+        val serviceIntent = Intent(this, TransferService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+        bindService(serviceIntent, serviceConn, Context.BIND_AUTO_CREATE)
 
         setContent {
             val systemDark = isSystemInDarkTheme()
@@ -113,38 +135,10 @@ class MainActivity : ComponentActivity() {
                         onNotifyFileSaved = { file -> FileHelper.notifyMediaScanner(this, file) },
                         onOpenDownloadFolder = { openDownloadFolder() },
                         onFetchApps = { FileHelper.getInstalledApps(this) },
-                        onSetStayAwake = { enable -> setTransferAwake(enable) },
-                        onStartSend = { ip, onLog, onProgress, onFinish ->
-                            engine.sendItems(this, ip, selectedItems.toList(), onLog, onProgress)
-                            onFinish()
-                        },
-                        engine = engine
+                        transferServiceGetter = { transferService }
                     )
                 }
             }
-        }
-    }
-
-    // 核心保活：传输时阻止 CPU 和 Wi-Fi 芯片休眠
-    private fun setTransferAwake(enable: Boolean) {
-        if (enable) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            if (wakeLock == null) {
-                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "P2PTransfer::Lock")
-                wakeLock?.acquire(60 * 60 * 1000L /* 1小时保护上限 */)
-            }
-            if (wifiLock == null) {
-                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "P2PTransfer::WifiLock")
-                wifiLock?.acquire()
-            }
-        } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            wakeLock?.let { if (it.isHeld) it.release() }
-            wakeLock = null
-            wifiLock?.let { if (it.isHeld) it.release() }
-            wifiLock = null
         }
     }
 
@@ -163,6 +157,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkAllFilesAccessPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
                 val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
@@ -170,18 +167,15 @@ class MainActivity : ComponentActivity() {
                 }
                 startActivity(intent)
             }
-        } else {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE),
-                100
-            )
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        setTransferAwake(false)
+        if (isServiceBound) {
+            unbindService(serviceConn)
+            isServiceBound = false
+        }
     }
 }
 
@@ -233,20 +227,16 @@ fun TransferAppScreen(
     onNotifyFileSaved: (File) -> Unit,
     onOpenDownloadFolder: () -> Unit,
     onFetchApps: () -> List<AppItem>,
-    onSetStayAwake: (Boolean) -> Unit,
-    onStartSend: suspend (ip: String, onLog: (String) -> Unit, onProgress: (String, Float, Int, Int) -> Unit, onFinish: () -> Unit) -> Unit,
-    engine: TransferEngine
+    transferServiceGetter: () -> TransferService?
 ) {
     var mode by remember { mutableStateOf("HOME") }
     var logs by remember { mutableStateOf("") }
 
-    // 进度显示变量
     var currentItemName by remember { mutableStateOf("") }
     var singleProgress by remember { mutableStateOf(0f) }
     var currentIndex by remember { mutableStateOf(0) }
     var totalCount by remember { mutableStateOf(0) }
 
-    val scope = rememberCoroutineScope()
     var showAppConfirmDialog by remember { mutableStateOf(false) }
     var targetIp by remember { mutableStateOf("192.168.43.1") }
     var serverLocalIp by remember { mutableStateOf("") }
@@ -270,7 +260,6 @@ fun TransferAppScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        // 顶部栏与深色模式切换按钮
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -278,7 +267,7 @@ fun TransferAppScreen(
         ) {
             Column {
                 Text("P2P 热点快传", style = MaterialTheme.typography.headlineMedium)
-                Text("纯热点对传 · CRC32防损 · 锁屏保活", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("前台常驻服务 · 单次秒级校验 · 切后台不掉线", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             }
             IconButton(onClick = onToggleDarkMode) {
                 Icon(
@@ -299,24 +288,25 @@ fun TransferAppScreen(
                         onClick = {
                             mode = "RECEIVER"
                             serverLocalIp = getLocalHotspotIp()
-                            onSetStayAwake(true) // 接收端开启常亮防休眠
-                            scope.launch {
-                                engine.startServer(
-                                    onLog = { logs += "\n$it" },
-                                    onProgress = { name, p, curr, total ->
-                                        currentItemName = name
-                                        singleProgress = p
-                                        currentIndex = curr
-                                        totalCount = total
-                                    },
-                                    onCompleted = { file ->
-                                        onNotifyFileSaved(file)
-                                        if (file.name.endsWith(".apk")) {
-                                            onInstallApk(file)
-                                        }
+                            val service = transferServiceGetter()
+                            service?.runReceiverTask(
+                                onLog = { logs += "\n$it" },
+                                onProgress = { name, p, curr, total ->
+                                    currentItemName = name
+                                    singleProgress = p
+                                    currentIndex = curr
+                                    totalCount = total
+                                },
+                                onCompleted = { file ->
+                                    onNotifyFileSaved(file)
+                                    if (file.name.endsWith(".apk")) {
+                                        onInstallApk(file)
                                     }
-                                )
-                            }
+                                },
+                                onAllFinished = {
+                                    logs += "\n[状态] 服务端任务完成，通知栏与前台服务已退出"
+                                }
+                            )
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -339,7 +329,7 @@ fun TransferAppScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("本机热点真实 IP: $serverLocalIp", style = MaterialTheme.typography.titleMedium)
-                    Text("锁屏/常亮保活已生效", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    Text("前台服务运行中：可切后台 / 划小窗 / 关屏", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
 
                     val qr = remember(serverLocalIp) { generateQrBitmap("p2p://$serverLocalIp") }
                     qr?.let {
@@ -357,7 +347,6 @@ fun TransferAppScreen(
                         Text("打开接收文件夹")
                     }
 
-                    // 进度可视化条
                     if (totalCount > 0) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -406,18 +395,22 @@ fun TransferAppScreen(
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = {
-                        onSetStayAwake(true) // 发送端开始前开启保活
-                        scope.launch {
-                            onStartSend(targetIp, { logs += "\n$it" }, { name, p, curr, total ->
+                        val service = transferServiceGetter()
+                        service?.runSenderTask(
+                            targetIp = targetIp,
+                            items = selectedItems.toList(),
+                            onLog = { logs += "\n$it" },
+                            onProgress = { name, p, curr, total ->
                                 currentItemName = name
                                 singleProgress = p
                                 currentIndex = curr
                                 totalCount = total
-                            }, {
+                            },
+                            onAllFinished = {
                                 selectedItems.clear()
-                                onSetStayAwake(false) // 传输结束后释放保活锁
-                            })
-                        }
+                                logs += "\n[状态] 发送完毕，通知栏与前台服务已退出"
+                            }
+                        )
                     },
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
@@ -432,7 +425,6 @@ fun TransferAppScreen(
                 }
             }
 
-            // 发送端进度可视化条
             if (totalCount > 0) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
