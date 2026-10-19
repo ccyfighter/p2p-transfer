@@ -12,13 +12,23 @@ import android.provider.OpenableColumns
 import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStream
 
 data class TransferItem(
     val name: String,
     val size: Long,
-    val openStream: (Context) -> InputStream?
-)
+    val realPath: String? = null, // 若有物理路径，优先极速读取
+    val contentUri: Uri? = null   // 系统选择器兜底
+) {
+    fun openStream(context: Context): InputStream? {
+        return if (realPath != null) {
+            FileInputStream(File(realPath))
+        } else if (contentUri != null) {
+            context.contentResolver.openInputStream(contentUri)
+        } else null
+    }
+}
 
 data class AppItem(
     val name: String,
@@ -29,25 +39,21 @@ data class AppItem(
 
 object FileHelper {
 
-    // 获取公共存储目录：内部存储/Download/P2PTransfer
     fun getDownloadDir(): File {
         val target = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "P2PTransfer")
         if (!target.exists()) target.mkdirs()
         return target
     }
 
-    // 关键：通知系统媒体扫描器，让相册、视频、文件管理器立即展示新接收的文件
     fun notifyMediaScanner(context: Context, file: File) {
         MediaScannerConnection.scanFile(
             context,
             arrayOf(file.absolutePath),
+            null,
             null
-        ) { path, uri ->
-            // 媒体库索引更新完成
-        }
+        )
     }
 
-    // 获取非系统应用列表
     fun getInstalledApps(context: Context): List<AppItem> {
         val pm = context.packageManager
         val list = mutableListOf<AppItem>()
@@ -71,12 +77,9 @@ object FileHelper {
         return list.sortedBy { it.name }
     }
 
-    // 严谨获取 URI 文件大小（解决图片选择时返回 0 的问题）
     fun getUriDetails(context: Context, uri: Uri): Pair<String, Long> {
         var name = "unknown_${System.currentTimeMillis()}"
         var size = 0L
-
-        // 尝试通过 ContentResolver 查询
         try {
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
@@ -88,7 +91,6 @@ object FileHelper {
             }
         } catch (_: Exception) {}
 
-        // 如果未取到大小，回退到 FileDescriptor 查询
         if (size <= 0L) {
             try {
                 context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
@@ -99,38 +101,50 @@ object FileHelper {
         return Pair(name, size)
     }
 
-    // 递归遍历用户选中的文件夹，并平铺所有零散子文件
-    fun collectTreeFiles(context: Context, treeUri: Uri): List<TransferItem> {
-        val root = DocumentFile.fromTreeUri(context, treeUri) ?: return emptyList()
-        val list = mutableListOf<TransferItem>()
-        traverseDocument(context, root, "", list)
-        return list
+    // 毫秒级极速扫描：借助已有所有文件权限，将 URI 解析为实际物理路径直接做原生 IO
+    fun collectTreeFilesFast(context: Context, treeUri: Uri): List<TransferItem> {
+        val result = mutableListOf<TransferItem>()
+        val path = treeUri.path ?: ""
+        
+        // 尝试从 treeUri (形如 /tree/primary:DCIM/Camera) 还原出实际路径
+        var physicalDir: File? = null
+        if (path.contains("primary:")) {
+            val subPath = path.substringAfter("primary:").substringBefore("/document")
+            val rawFile = File(Environment.getExternalStorageDirectory(), subPath)
+            if (rawFile.exists() && rawFile.isDirectory) {
+                physicalDir = rawFile
+            }
+        }
+
+        if (physicalDir != null) {
+            // 原生物理扫描：4000 个文件只需要数十毫秒
+            val rootPath = physicalDir.absolutePath
+            val rootName = physicalDir.name
+            physicalDir.walkTopDown().forEach { file ->
+                if (file.isFile) {
+                    val rel = file.absolutePath.removePrefix(rootPath).removePrefix("/")
+                    val fullRel = "$rootName/$rel"
+                    result.add(TransferItem(name = fullRel, size = file.length(), realPath = file.absolutePath))
+                }
+            }
+        } else {
+            // 兜底慢速扫描
+            val root = DocumentFile.fromTreeUri(context, treeUri) ?: return emptyList()
+            traverseSlow(root, "", result)
+        }
+        return result
     }
 
-    private fun traverseDocument(
-        context: Context,
-        doc: DocumentFile,
-        parentPath: String,
-        outList: MutableList<TransferItem>
-    ) {
+    private fun traverseSlow(doc: DocumentFile, parentPath: String, outList: MutableList<TransferItem>) {
         if (doc.isDirectory) {
             val currentDir = if (parentPath.isEmpty()) doc.name.orEmpty() else "$parentPath/${doc.name}"
-            doc.listFiles().forEach { child ->
-                traverseDocument(context, child, currentDir, outList)
-            }
+            doc.listFiles().forEach { child -> traverseSlow(child, currentDir, outList) }
         } else if (doc.isFile) {
             val fullRelPath = if (parentPath.isEmpty()) doc.name.orEmpty() else "$parentPath/${doc.name}"
-            outList.add(
-                TransferItem(
-                    name = fullRelPath,
-                    size = doc.length(),
-                    openStream = { ctx -> ctx.contentResolver.openInputStream(doc.uri) }
-                )
-            )
+            outList.add(TransferItem(name = fullRelPath, size = doc.length(), contentUri = doc.uri))
         }
     }
 
-    // 调起系统安装器
     fun installApk(context: Context, apkFile: File) {
         val uri: Uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             FileProvider.getUriForFile(context, "${context.packageName}.provider", apkFile)
