@@ -34,20 +34,23 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
+import androidx.lifecycle.lifecycleScope
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileInputStream
 import java.net.NetworkInterface
 
 class MainActivity : ComponentActivity() {
 
     val selectedItems = mutableStateListOf<TransferItem>()
     private var scannedIpCallback: ((String) -> Unit)? = null
+    var isScanning by mutableStateOf(false)
 
-    // Service 绑定相关
     var transferService: TransferService? = null
     var isServiceBound = false
 
@@ -65,24 +68,32 @@ class MainActivity : ComponentActivity() {
     }
 
     private val pickFilesLauncher = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        uris?.forEach { uri ->
-            val details = FileHelper.getUriDetails(this, uri)
-            selectedItems.add(
-                TransferItem(
-                    name = details.first,
-                    size = details.second,
-                    openStream = { ctx -> ctx.contentResolver.openInputStream(uri) }
-                )
-            )
+        uris?.let { list ->
+            lifecycleScope.launch(Dispatchers.IO) {
+                val newItems = list.map { uri ->
+                    val details = FileHelper.getUriDetails(this@MainActivity, uri)
+                    TransferItem(name = details.first, size = details.second, contentUri = uri)
+                }
+                withContext(Dispatchers.Main) {
+                    selectedItems.addAll(newItems)
+                    Toast.makeText(this@MainActivity, "已添加 ${newItems.size} 个文件", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
-        Toast.makeText(this, "已添加 ${uris.size} 个文件", Toast.LENGTH_SHORT).show()
     }
 
+    // 解决黑屏关键：移到后台 IO 线程秒级扫描
     private val pickFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         uri?.let {
-            val list = FileHelper.collectTreeFiles(this, it)
-            selectedItems.addAll(list)
-            Toast.makeText(this, "已展开添加 ${list.size} 个散落文件", Toast.LENGTH_SHORT).show()
+            isScanning = true
+            lifecycleScope.launch(Dispatchers.IO) {
+                val list = FileHelper.collectTreeFilesFast(this@MainActivity, it)
+                withContext(Dispatchers.Main) {
+                    selectedItems.addAll(list)
+                    isScanning = false
+                    Toast.makeText(this@MainActivity, "扫描完成：共加入 ${list.size} 个散落文件", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
@@ -100,7 +111,6 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         checkAllFilesAccessPermission()
 
-        // 启动并绑定前台服务
         val serviceIntent = Intent(this, TransferService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent)
@@ -118,6 +128,7 @@ class MainActivity : ComponentActivity() {
                     TransferAppScreen(
                         isDarkMode = isDarkMode,
                         onToggleDarkMode = { isDarkMode = !isDarkMode },
+                        isScanning = isScanning,
                         selectedItems = selectedItems,
                         onPickSingleFiles = { pickFilesLauncher.launch(arrayOf("*/*")) },
                         onOpenFolderPicker = { pickFolderLauncher.launch(null) },
@@ -219,6 +230,7 @@ fun generateQrBitmap(content: String): Bitmap? {
 fun TransferAppScreen(
     isDarkMode: Boolean,
     onToggleDarkMode: () -> Unit,
+    isScanning: Boolean,
     selectedItems: MutableList<TransferItem>,
     onPickSingleFiles: () -> Unit,
     onOpenFolderPicker: () -> Unit,
@@ -267,7 +279,7 @@ fun TransferAppScreen(
         ) {
             Column {
                 Text("P2P 热点快传", style = MaterialTheme.typography.headlineMedium)
-                Text("前台常驻服务 · 单次秒级校验 · 切后台不掉线", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("大文件毫秒直扫 · 防闪退优化", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             }
             IconButton(onClick = onToggleDarkMode) {
                 Icon(
@@ -304,7 +316,7 @@ fun TransferAppScreen(
                                     }
                                 },
                                 onAllFinished = {
-                                    logs += "\n[状态] 服务端任务完成，通知栏与前台服务已退出"
+                                    logs += "\n[状态] 所有项目接收完毕！"
                                 }
                             )
                         },
@@ -329,7 +341,7 @@ fun TransferAppScreen(
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("本机热点真实 IP: $serverLocalIp", style = MaterialTheme.typography.titleMedium)
-                    Text("前台服务运行中：可切后台 / 划小窗 / 关屏", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    Text("保存至 Download/P2PTransfer", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
 
                     val qr = remember(serverLocalIp) { generateQrBitmap("p2p://$serverLocalIp") }
                     qr?.let {
@@ -382,8 +394,16 @@ fun TransferAppScreen(
                 Button(onClick = onPickSingleFiles, modifier = Modifier.weight(1f)) {
                     Text("选文件", style = MaterialTheme.typography.labelMedium)
                 }
-                Button(onClick = onOpenFolderPicker, modifier = Modifier.weight(1f)) {
-                    Text("选文件夹", style = MaterialTheme.typography.labelMedium)
+                Button(
+                    onClick = onOpenFolderPicker,
+                    modifier = Modifier.weight(1f),
+                    enabled = !isScanning
+                ) {
+                    if (isScanning) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text("选文件夹", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
                 Button(onClick = { showAppConfirmDialog = true }, modifier = Modifier.weight(1f)) {
                     Text("扫应用", style = MaterialTheme.typography.labelMedium)
@@ -408,14 +428,16 @@ fun TransferAppScreen(
                             },
                             onAllFinished = {
                                 selectedItems.clear()
-                                logs += "\n[状态] 发送完毕，通知栏与前台服务已退出"
+                                logs += "\n[状态] 所有项目已满速推送完毕！"
                             }
                         )
                     },
                     modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    enabled = selectedItems.isNotEmpty() && !isScanning
                 ) {
-                    Text("开始传输 (${selectedItems.size}项)")
+                    val totalMB = selectedItems.sumOf { it.size } / 1024 / 1024
+                    Text("开始传输 (${selectedItems.size}项 / 约${totalMB}MB)")
                 }
 
                 if (selectedItems.isNotEmpty()) {
@@ -453,7 +475,7 @@ fun TransferAppScreen(
                                         TransferItem(
                                             name = "${app.name}.apk",
                                             size = app.size,
-                                            openStream = { FileInputStream(app.apkFile) }
+                                            realPath = app.apkFile.absolutePath
                                         )
                                     )
                                 }
