@@ -294,8 +294,8 @@ class TransferEngine {
                             onProgress(item.name, if (p > 0.99f) 0.99f else p, currentIndex, items.size)
                         }
                     }
-                    rawOut.writeInt(0)     // 本文件结束标记
-                    rawOut.flush()
+                    dos.writeInt(0)     // 本文件结束标记
+                    dos.flush()
                     dos.writeLong(crc?.value ?: 0L)
                     dos.flush()
                 }
