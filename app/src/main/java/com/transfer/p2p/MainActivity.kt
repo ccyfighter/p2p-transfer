@@ -55,8 +55,8 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -343,6 +343,11 @@ fun TransferAppScreen(
     var serverLocalIp by remember { mutableStateOf("") }
     var appList by remember { mutableStateOf<List<AppItem>>(emptyList()) }
 
+    // 聊天室状态
+    var chatMessages by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
+    var chatConnected by remember { mutableStateOf(false) }
+    var chatStatus by remember { mutableStateOf("未连接") }
+
     if (showAppConfirmDialog) {
         AlertDialog(
             onDismissRequest = { showAppConfirmDialog = false },
@@ -369,7 +374,7 @@ fun TransferAppScreen(
             Column(modifier = Modifier.weight(1f)) {
                 Text("P2P 热点快传", style = MaterialTheme.typography.headlineMedium)
                 Text(
-                    "常驻监听 · 断点续传 · 满速直连 · 0 流量",
+                    "常驻监听 · 断点续传 · 满速直连 · 聊天室 · 0 流量",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.Gray
                 )
@@ -426,9 +431,18 @@ fun TransferAppScreen(
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))
+
+                    Button(
+                        onClick = { mode = "CHAT" },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("聊天室（互发文字 · 粘贴 / 复制）")
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        "提速提示：热点请设为 5GHz + WPA2，两机距离 1 米内，实测可达 45~70MB/s；" +
-                                "2.4GHz 只有 10~20MB/s。",
+                        "提速提示：热点设为 5GHz + WPA2、两机距离 1 米内，实测 45~70MB/s；" +
+                                "聊天室走独立端口 9098，可与文件传输同时进行。",
                         style = MaterialTheme.typography.labelSmall,
                         color = Color.Gray
                     )
@@ -504,6 +518,11 @@ fun TransferAppScreen(
                         LinearProgressIndicator(progress = singleProgress, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
                         Text("${(singleProgress * 100).toInt()}%", style = MaterialTheme.typography.labelSmall)
                     }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    OutlinedButton(onClick = { mode = "HOME" }, modifier = Modifier.fillMaxWidth()) {
+                        Text("返回主菜单")
+                    }
                 }
             }
         }
@@ -555,7 +574,7 @@ fun TransferAppScreen(
                 Switch(checked = keepCellular, onCheckedChange = onToggleCellular)
             }
             Text(
-                "传输走 Wi‑Fi 内网直连（已强绑定 Wi‑Fi 通道，0 流量）；" +
+                "传输走 Wi-Fi 内网直连（已强绑定 Wi-Fi 通道，0 流量）；" +
                         "本机其他 App 想上网，请再打开系统「WLAN 助理 / 数据加速」。",
                 style = MaterialTheme.typography.labelSmall,
                 color = Color.Gray
@@ -652,6 +671,71 @@ fun TransferAppScreen(
                             }
                         }
                     }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            OutlinedButton(onClick = { mode = "HOME" }, modifier = Modifier.fillMaxWidth()) {
+                Text("返回主菜单")
+            }
+        }
+
+        if (mode == "CHAT") {
+            Card(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("聊天室", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = { mode = "HOME" }) { Text("返回") }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    ChatScreen(
+                        status = chatStatus,
+                        connected = chatConnected,
+                        autoListen = isListening,
+                        messages = chatMessages,
+                        targetIp = targetIp,
+                        onTargetIpChange = { targetIp = it },
+                        onListen = {
+                            transferServiceGetter()?.startChatServer(
+                                onState = { c, s ->
+                                    chatConnected = c
+                                    chatStatus = s
+                                    logs = appendLog(logs, "聊天：$s")
+                                },
+                                onMessage = { t -> chatMessages = chatMessages + ChatMessage(t, false) },
+                                onError = { e ->
+                                    chatStatus = e
+                                    logs = appendLog(logs, "聊天异常：$e")
+                                }
+                            )
+                        },
+                        onConnect = {
+                            transferServiceGetter()?.connectChat(
+                                targetIp,
+                                onState = { c, s ->
+                                    chatConnected = c
+                                    chatStatus = s
+                                    logs = appendLog(logs, "聊天：$s")
+                                },
+                                onMessage = { t -> chatMessages = chatMessages + ChatMessage(t, false) },
+                                onError = { e ->
+                                    chatStatus = e
+                                    logs = appendLog(logs, "聊天异常：$e")
+                                }
+                            )
+                        },
+                        onDisconnect = {
+                            transferServiceGetter()?.stopChat()
+                            chatConnected = false
+                            chatStatus = "已断开"
+                        },
+                        onSend = { text ->
+                            val ok = transferServiceGetter()?.sendChat(text) == true
+                            if (ok) chatMessages = chatMessages + ChatMessage(text, true)
+                            ok
+                        },
+                        onClear = { chatMessages = emptyList() }
+                    )
                 }
             }
         }
