@@ -35,6 +35,7 @@ class TransferService : Service() {
     private val binder = LocalBinder()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val engine = TransferEngine()
+    private val chat = ChatEngine()
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -55,25 +56,25 @@ class TransferService : Service() {
         super.onCreate()
         createNotificationChannel()
         acquireLocks()
-        // ★ 必须在 onCreate 里立刻进前台：否则 startForegroundService 后 5 秒未 startForeground 会被系统杀进程（闪退）
-        pushNotification("P2P 快传待命中", "服务已就绪，等待接收或发送", 0, 0, true)
+        pushNotification("P2P 快传待命中", "服务已就绪，等待接收、发送或聊天", 0, 0, true)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        pushNotification("P2P 快传待命中", "服务已就绪，等待接收或发送", 0, 0, true)
+        pushNotification("P2P 快传待命中", "服务已就绪，等待接收、发送或聊天", 0, 0, true)
         return START_STICKY
     }
 
-    /** Android 14 上 dataSync 前台服务有 6 小时超时，超时前优雅收尾 */
+    /** Android 14 的 dataSync 前台服务 6 小时上限 */
     override fun onTimeout(startId: Int) {
         super.onTimeout(startId)
-        pushNotification("前台服务已达 6 小时上限", "即将停止，请重新打开 App 继续", 0, 0, true)
+        pushNotification("前台服务已达 6 小时上限", "即将停止，请重新打开 App", 0, 0, true)
         stopListening()
+        chat.stop()
         stopSelf()
     }
 
     fun isListening(): Boolean = listenJob?.isActive == true
-    fun isBusy(): Boolean = listenJob?.isActive == true || sendJob?.isActive == true
+    fun isBusy(): Boolean = listenJob?.isActive == true || sendJob?.isActive == true || chat.isActive()
 
     /** 幂等：已在监听则直接返回 */
     fun startListening(
@@ -108,7 +109,7 @@ class TransferService : Service() {
     fun stopListening() {
         listenJob?.cancel()
         listenJob = null
-        pushNotification("P2P 快传待命中", "已停止监听", 0, 0, true)
+        pushNotification("P2P 快传待命中", "已停止文件接收监听", 0, 0, true)
     }
 
     fun sendTask(
@@ -148,9 +149,44 @@ class TransferService : Service() {
         }
     }
 
+    // ==================== 聊天室（独立端口，不影响文件传输） ====================
+
+    fun startChatServer(
+        onState: (Boolean, String) -> Unit,
+        onMessage: (String) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        pushNotification("聊天室运行中", "等待对方加入（端口 ${ChatEngine.CHAT_PORT}）", 0, 0, true)
+        chat.startServer(object : ChatEngine.Listener {
+            override fun onState(connected: Boolean, info: String) = postMain { onState(connected, info) }
+            override fun onMessage(text: String) = postMain { onMessage(text) }
+            override fun onError(msg: String) = postMain { onError(msg) }
+        })
+    }
+
+    fun connectChat(
+        ip: String,
+        onState: (Boolean, String) -> Unit,
+        onMessage: (String) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        pushNotification("聊天室连接中", ip, 0, 0, true)
+        chat.connect(ip, applicationContext, object : ChatEngine.Listener {
+            override fun onState(connected: Boolean, info: String) = postMain { onState(connected, info) }
+            override fun onMessage(text: String) = postMain { onMessage(text) }
+            override fun onError(msg: String) = postMain { onError(msg) }
+        })
+    }
+
+    fun sendChat(text: String): Boolean = chat.send(text)
+
+    fun stopChat() {
+        chat.stop()
+        pushNotification("P2P 快传待命中", "聊天室已关闭", 0, 0, true)
+    }
+
     // ---------------- 内部工具 ----------------
 
-    /** 80ms 节流，避免每 1MB 块都触发一次 Compose 重组 */
     private fun progressThrottled(
         action: String,
         onProgress: (String, Float, Int, Int) -> Unit
@@ -169,7 +205,7 @@ class TransferService : Service() {
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(CHANNEL_ID, "传输任务通知", NotificationManager.IMPORTANCE_LOW).apply {
-            description = "展示快传实时后台进度"
+            description = "展示快传与聊天室实时状态"
             setSound(null, null)
             enableVibration(false)
         }
@@ -208,7 +244,7 @@ class TransferService : Service() {
     private fun acquireLocks() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "P2PTransfer::ServiceWakeLock").apply {
-            acquire(5 * 60 * 60 * 1000L)   // 5 小时，配合 dataSync 的 6 小时上限
+            acquire(5 * 60 * 60 * 1000L)
         }
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "P2PTransfer::ServiceWifiLock").apply {
@@ -217,6 +253,7 @@ class TransferService : Service() {
     }
 
     override fun onDestroy() {
+        chat.stop()
         super.onDestroy()
         scope.cancel()
         wakeLock?.let { if (it.isHeld) it.release() }
